@@ -7,8 +7,10 @@ from pydantic import ValidationError
 from marginal.cli import main
 from marginal.cli.review import (
     MAX_FINDINGS_PER_REVIEW,
+    MAX_GRAPH_CONTEXT_CALLERS,
     _base_lines,
     _build_finding_prompt,
+    _build_graph_context_section,
     _build_inline_comments,
     _coverage_warning_lines,
     _finding_badge,
@@ -24,6 +26,7 @@ from marginal.github.errors import (
     GitHubNotFoundError,
     PermissionDeniedError,
 )
+from marginal.graph import CallSite, ChangedDefinition, Definition
 from marginal.providers.errors import MissingCredentialsError
 from marginal.review import Finding, Severity
 
@@ -348,7 +351,7 @@ def test_base_lines_skips_the_details_block_with_no_files():
 def test_build_finding_prompt_without_policies_is_unchanged():
     files = [{"filename": "marginal/retry.py", "patch": "@@ -1,3 +1,4 @@\n+time.sleep(1)"}]
 
-    prompt = _build_finding_prompt(files, [])
+    prompt = _build_finding_prompt(files, [], [], ".")
 
     assert "policies" not in prompt.lower()
     assert prompt.endswith("--- marginal/retry.py ---\n@@ -1,3 +1,4 @@\n+time.sleep(1)")
@@ -358,7 +361,7 @@ def test_build_finding_prompt_folds_policy_content_in():
     files = [{"filename": "marginal/retry.py", "patch": "+time.sleep(1)"}]
     policies = [(".marginal/policies/coding.md", "Never use a blocking sleep in async code.")]
 
-    prompt = _build_finding_prompt(files, policies)
+    prompt = _build_finding_prompt(files, policies, [], ".")
 
     assert ".marginal/policies/coding.md" in prompt
     assert "Never use a blocking sleep in async code." in prompt
@@ -373,7 +376,7 @@ def test_build_finding_prompt_folds_policy_content_in():
 def test_build_finding_prompt_redacts_a_secret_in_the_patch():
     files = [{"filename": "marginal/config.py", "patch": "+api_key = 'AKIAIOSFODNN7EXAMPLE'"}]
 
-    prompt = _build_finding_prompt(files, [])
+    prompt = _build_finding_prompt(files, [], [], ".")
 
     assert "AKIAIOSFODNN7EXAMPLE" not in prompt
     assert prompt.endswith("--- marginal/config.py ---\n+api_key = '[REDACTED]'")
@@ -905,6 +908,125 @@ def test_review_with_a_missing_policy_file_does_not_crash(
     assert ".marginal/policies/missing.md" in err
     prompt = provider.generate_structured.call_args.args[0]
     assert "missing.md" not in prompt
+
+
+# -- review: graph context folding ------------------------------------------
+
+
+def _write_cross_file_caller_fixture(tmp_path):
+    """`pkg/a.py` defines `helper`; `pkg/b.py` calls it -- an out-of-diff
+    caller for any diff that only touches `pkg/a.py`."""
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "a.py").write_text("def helper():\n    return 1\n")
+    (tmp_path / "pkg" / "b.py").write_text("def use_helper():\n    return helper()\n")
+
+
+def test_review_includes_graph_context_for_an_out_of_diff_caller(
+    tmp_path, capsys, monkeypatch, mock_github_client, mock_provider
+):
+    monkeypatch.chdir(tmp_path)
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    _write_reviewer_config(tmp_path)
+    _write_cross_file_caller_fixture(tmp_path)
+    client = mock_github_client.return_value
+    client.get_pull_request.return_value = _pull_request()
+    client.get_pull_request_files.return_value = [
+        {
+            "filename": "pkg/a.py",
+            "patch": "@@ -1,2 +1,2 @@\n def helper():\n-    return 1\n+    return 2\n",
+        }
+    ]
+    provider = mock_provider.return_value
+    provider.generate_structured = AsyncMock(return_value=_FindingsResponse(findings=[]))
+
+    exit_code = main(["review", "--repo", "acme/widgets", "--pr", "42"])
+
+    assert exit_code == 0
+    prompt = provider.generate_structured.call_args.args[0]
+    assert "pkg.a.helper" in prompt
+    assert "pkg/b.py:2" in prompt
+    assert "return helper()" in prompt
+
+
+def test_review_omits_graph_context_when_code_graph_is_disabled(
+    tmp_path, capsys, monkeypatch, mock_github_client, mock_provider
+):
+    monkeypatch.chdir(tmp_path)
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    config_dir = tmp_path / ".marginal"
+    config_dir.mkdir()
+    (config_dir / "config.yaml").write_text(
+        "version: 1\n"
+        "models:\n"
+        "  reviewer:\n"
+        "    provider: anthropic\n"
+        "    model: claude-3-5-sonnet\n"
+        "context:\n"
+        "  code_graph: false\n"
+    )
+    _write_cross_file_caller_fixture(tmp_path)
+    client = mock_github_client.return_value
+    client.get_pull_request.return_value = _pull_request()
+    client.get_pull_request_files.return_value = [
+        {
+            "filename": "pkg/a.py",
+            "patch": "@@ -1,2 +1,2 @@\n def helper():\n-    return 1\n+    return 2\n",
+        }
+    ]
+    provider = mock_provider.return_value
+    provider.generate_structured = AsyncMock(return_value=_FindingsResponse(findings=[]))
+
+    exit_code = main(["review", "--repo", "acme/widgets", "--pr", "42"])
+
+    assert exit_code == 0
+    prompt = provider.generate_structured.call_args.args[0]
+    assert "pkg.a.helper" not in prompt
+    assert "pkg/b.py" not in prompt
+
+
+def test_review_skips_graph_context_outside_a_git_repo(
+    tmp_path, capsys, monkeypatch, mock_github_client, mock_provider
+):
+    """`build_symbol_graph` needs `git ls-files`; outside a git working tree
+    it fails, and that failure must not fail the review -- just warn and
+    skip the section, the same as `code_graph: false`."""
+    monkeypatch.chdir(tmp_path)
+    _write_reviewer_config(tmp_path)
+    client = mock_github_client.return_value
+    client.get_pull_request.return_value = _pull_request()
+    client.get_pull_request_files.return_value = [{"filename": "pkg/a.py", "patch": "+x = 1"}]
+    provider = mock_provider.return_value
+    provider.generate_structured = AsyncMock(return_value=_FindingsResponse(findings=[]))
+
+    exit_code = main(["review", "--repo", "acme/widgets", "--pr", "42"])
+
+    assert exit_code == 0
+    err = capsys.readouterr().err
+    assert "couldn't build code-graph context" in err
+
+
+def test_build_graph_context_section_skips_unreadable_callers_to_reach_a_readable_one(
+    tmp_path,
+):
+    """A definition's callers are tried in order until `MAX_GRAPH_CONTEXT_CALLERS`
+    snippets are actually collected -- an unreadable caller must not consume
+    a cap slot and hide a later, readable one for the same definition."""
+    (tmp_path / "readable.py").write_text("line1\nline2\nline3\n")
+    definition = Definition(
+        qualified_name="pkg.a.helper", file="pkg/a.py", line_start=1, line_end=2
+    )
+    unreadable_callers = [
+        CallSite(file=f"missing_{i}.py", line=1) for i in range(MAX_GRAPH_CONTEXT_CALLERS)
+    ]
+    changed = ChangedDefinition(
+        definition=definition,
+        callers=[*unreadable_callers, CallSite(file="readable.py", line=2)],
+    )
+
+    section = _build_graph_context_section([changed], str(tmp_path))
+
+    assert section is not None
+    assert "readable.py:2" in section
 
 
 # -- review: secret redaction warning --------------------------------------
