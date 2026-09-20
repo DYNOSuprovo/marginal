@@ -10,6 +10,24 @@
 
 ### Fixes
 
+- Fixes a regression introduced in v0.2.3: `AnthropicProvider.generate_structured`'s
+  `strict: true` tool definition was rejected outright by the API (`400
+  invalid_request_error`) for every request, because `Finding.confidence`'s
+  `ge`/`le` bounds and `_FindingsResponse.findings`' `max_length` render as
+  `minimum`/`maximum`/`maxItems` -- keywords outside strict tool use's supported
+  JSON Schema subset. The wire schema sent to Anthropic now has those keywords
+  stripped (and a nullable field's `anyOf: [{type: X}, {type: "null"}]` rewritten
+  to the `{"type": [X, "null"]}` form Anthropic's docs describe), while pydantic's
+  own validation of the response still enforces the same bounds locally -- the
+  server-side guarantee for a bound is gone, the check itself isn't.
+  `_strict_input_schema` checks every schema keyword against two explicit
+  lists (confirmed-unsupported -> stripped, confirmed-supported -> kept) and
+  raises immediately on anything in neither -- a keyword nobody's vetted yet
+  now breaks a test the next time a constrained field is added, instead of
+  breaking production the way this regression did
+
+  ([ISSUE-96](https://github.com/exactml/marginal/issues/96))
+
 ### Warnings
 
 ## marginal v0.2.3, 2026-09-20
